@@ -21,7 +21,8 @@ type Config struct {
 	UpstreamBaseURL    string
 	UpstreamAPIKey     string
 	ListenAddr         string
-	MaxMultipartMemory int64`r`n	MaxRequestBody int64
+	MaxMultipartMemory int64
+	MaxRequestBody     int64
 	ModelPrefixes      []string
 }
 
