@@ -13,7 +13,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -23,6 +22,7 @@ type Config struct {
 	UpstreamAPIKey     string
 	ListenAddr         string
 	MaxMultipartMemory int64
+	ModelPrefixes      []string
 }
 
 type Bridge struct {
@@ -81,6 +81,10 @@ func (b *Bridge) handleGenerations(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "model and prompt are required", "type": "invalid_request_error"}})
 		return
 	}
+	if !b.handlesModel(req.Model) {
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": "model is not handled by this bridge", "type": "model_not_supported"}})
+		return
+	}
 	payload := buildChatRequest(req.Model, req.Prompt, nil, req.Size)
 	b.forward(c, payload)
 }
@@ -95,6 +99,10 @@ func (b *Bridge) handleEdits(c *gin.Context) {
 	prompt := strings.TrimSpace(c.PostForm("prompt"))
 	if model == "" || prompt == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "model and prompt are required", "type": "invalid_request_error"}})
+		return
+	}
+	if !b.handlesModel(model) {
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": "model is not handled by this bridge", "type": "model_not_supported"}})
 		return
 	}
 	headers := c.Request.MultipartForm.File["image"]
@@ -136,6 +144,18 @@ func (b *Bridge) handleEdits(c *gin.Context) {
 	b.forward(c, payload)
 }
 
+func (b *Bridge) handlesModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" || len(b.cfg.ModelPrefixes) == 0 {
+		return false
+	}
+	for _, prefix := range b.cfg.ModelPrefixes {
+		if strings.HasPrefix(model, strings.ToLower(strings.TrimSpace(prefix))) {
+			return true
+		}
+	}
+	return false
+}
 func buildChatRequest(model, prompt string, parts []contentPart, size string) chatRequest {
 	var content any = prompt
 	if parts != nil {
@@ -220,6 +240,15 @@ func upstreamEndpoint(base string) (string, error) {
 	return parsed.String(), nil
 }
 
+func parsePrefixes(value string) []string {
+	var prefixes []string
+	for _, item := range strings.Split(value, ",") {
+		if prefix := strings.TrimSpace(item); prefix != "" {
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	return prefixes
+}
 func LoadConfig() Config {
 	maxMemory := int64(32 << 20)
 	if value, err := strconv.ParseInt(os.Getenv("MAX_MULTIPART_MEMORY"), 10, 64); err == nil && value > 0 {
@@ -229,7 +258,5 @@ func LoadConfig() Config {
 	if addr == "" {
 		addr = ":8080"
 	}
-	return Config{UpstreamBaseURL: os.Getenv("UPSTREAM_BASE_URL"), UpstreamAPIKey: os.Getenv("UPSTREAM_API_KEY"), ListenAddr: addr, MaxMultipartMemory: maxMemory}
+	return Config{UpstreamBaseURL: os.Getenv("UPSTREAM_BASE_URL"), UpstreamAPIKey: os.Getenv("UPSTREAM_API_KEY"), ListenAddr: addr, MaxMultipartMemory: maxMemory, ModelPrefixes: parsePrefixes(os.Getenv("MODEL_PREFIXES"))}
 }
-
-var _ = time.Now

@@ -46,5 +46,8 @@ http://your-server:8080/v1
 | `UPSTREAM_API_KEY` | No | Used when the incoming request has no Bearer token. |
 | `LISTEN_ADDR` | No | Bind address; defaults to `:8080`. |
 | `MAX_MULTIPART_MEMORY` | No | Multipart parse memory limit in bytes; defaults to `33554432`. |
+| `MODEL_PREFIXES` | Yes | Comma-separated, case-insensitive model prefixes handled by the bridge. |
 
 Incoming `Authorization` is forwarded as-is. If it is missing, the bridge uses `UPSTREAM_API_KEY`.
+
+Requests whose model does not start with one of `MODEL_PREFIXES` receive `404` and are not forwarded.
