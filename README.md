@@ -50,4 +50,4 @@ http://your-server:8080/v1
 
 Incoming `Authorization` is forwarded as-is. If it is missing, the bridge uses `UPSTREAM_API_KEY`.
 
-Requests whose model does not start with one of `MODEL_PREFIXES` receive `404` and are not forwarded.
+Requests whose model does not start with one of `MODEL_PREFIXES` are forwarded unchanged to the original Images API path.

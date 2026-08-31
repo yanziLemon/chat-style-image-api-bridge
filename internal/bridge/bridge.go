@@ -72,37 +72,47 @@ func (b *Bridge) Register(r *gin.Engine) {
 }
 
 func (b *Bridge) handleGenerations(c *gin.Context) {
-	var req generationRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, b.cfg.MaxRequestBody))
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+	var req generationRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+	if !b.handlesModel(req.Model) {
+		b.forwardRaw(c, "/v1/images/generations", body, c.GetHeader("Content-Type"))
 		return
 	}
 	if strings.TrimSpace(req.Model) == "" || strings.TrimSpace(req.Prompt) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "model and prompt are required", "type": "invalid_request_error"}})
 		return
 	}
-	if !b.handlesModel(req.Model) {
-		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": "model is not handled by this bridge", "type": "model_not_supported"}})
-		return
-	}
-	payload := buildChatRequest(req.Model, req.Prompt, nil, req.Size)
-	b.forward(c, payload)
+	b.forwardChat(c, buildChatRequest(req.Model, req.Prompt, nil, req.Size))
 }
 
 func (b *Bridge) handleEdits(c *gin.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, b.cfg.MaxMultipartMemory*4)
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, b.cfg.MaxRequestBody))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	c.Request.ContentLength = int64(len(body))
 	if err := c.Request.ParseMultipartForm(b.cfg.MaxMultipartMemory); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": fmt.Sprintf("invalid multipart form: %v", err), "type": "invalid_request_error"}})
 		return
 	}
 	model := strings.TrimSpace(c.PostForm("model"))
+	if !b.handlesModel(model) {
+		b.forwardRaw(c, "/v1/images/edits", body, c.GetHeader("Content-Type"))
+		return
+	}
 	prompt := strings.TrimSpace(c.PostForm("prompt"))
 	if model == "" || prompt == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "model and prompt are required", "type": "invalid_request_error"}})
-		return
-	}
-	if !b.handlesModel(model) {
-		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": "model is not handled by this bridge", "type": "model_not_supported"}})
 		return
 	}
 	headers := c.Request.MultipartForm.File["image"]
@@ -123,12 +133,13 @@ func (b *Bridge) handleEdits(c *gin.Context) {
 		}
 		data, readErr := io.ReadAll(file)
 		closeErr := file.Close()
-		if readErr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": readErr.Error(), "type": "invalid_request_error"}})
-			return
-		}
-		if closeErr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": closeErr.Error(), "type": "invalid_request_error"}})
+		if readErr != nil || closeErr != nil {
+			if readErr != nil {
+				err = readErr
+			} else {
+				err = closeErr
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
 			return
 		}
 		contentType := fh.Header.Get("Content-Type")
@@ -140,21 +151,7 @@ func (b *Bridge) handleEdits(c *gin.Context) {
 		}
 		parts = append(parts, contentPart{Type: "image_url", ImageURL: &imageURLPart{URL: "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data)}})
 	}
-	payload := buildChatRequest(model, "", parts, c.PostForm("size"))
-	b.forward(c, payload)
-}
-
-func (b *Bridge) handlesModel(model string) bool {
-	model = strings.ToLower(strings.TrimSpace(model))
-	if model == "" || len(b.cfg.ModelPrefixes) == 0 {
-		return false
-	}
-	for _, prefix := range b.cfg.ModelPrefixes {
-		if strings.HasPrefix(model, strings.ToLower(strings.TrimSpace(prefix))) {
-			return true
-		}
-	}
-	return false
+	b.forwardChat(c, buildChatRequest(model, "", parts, c.PostForm("size")))
 }
 func buildChatRequest(model, prompt string, parts []contentPart, size string) chatRequest {
 	var content any = prompt
@@ -185,13 +182,17 @@ func sizeToAspectRatio(size string) string {
 	}
 }
 
-func (b *Bridge) forward(c *gin.Context, payload chatRequest) {
+func (b *Bridge) forwardChat(c *gin.Context, payload chatRequest) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error(), "type": "bridge_error"}})
 		return
 	}
-	endpoint, err := upstreamEndpoint(b.cfg.UpstreamBaseURL)
+	b.forwardRaw(c, "/v1/chat/completions", data, "application/json")
+}
+
+func (b *Bridge) forwardRaw(c *gin.Context, route string, data []byte, contentType string) {
+	endpoint, err := upstreamEndpoint(b.cfg.UpstreamBaseURL, route)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error(), "type": "configuration_error"}})
 		return
@@ -201,7 +202,10 @@ func (b *Bridge) forward(c *gin.Context, payload chatRequest) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error(), "type": "bridge_error"}})
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	req.Header.Set("Content-Type", contentType)
 	auth := c.GetHeader("Authorization")
 	if auth == "" && b.cfg.UpstreamAPIKey != "" {
 		auth = "Bearer " + b.cfg.UpstreamAPIKey
@@ -223,8 +227,7 @@ func (b *Bridge) forward(c *gin.Context, payload chatRequest) {
 	c.Status(resp.StatusCode)
 	_, _ = io.Copy(c.Writer, resp.Body)
 }
-
-func upstreamEndpoint(base string) (string, error) {
+func upstreamEndpoint(base, route string) (string, error) {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base == "" {
 		return "", fmt.Errorf("UPSTREAM_BASE_URL is required")
@@ -236,7 +239,7 @@ func upstreamEndpoint(base string) (string, error) {
 	if !strings.HasSuffix(parsed.Path, "/v1") {
 		parsed.Path = path.Join(parsed.Path, "v1")
 	}
-	parsed.Path = path.Join(parsed.Path, "chat/completions")
+	parsed.Path = path.Join(parsed.Path, route)
 	return parsed.String(), nil
 }
 
@@ -258,5 +261,5 @@ func LoadConfig() Config {
 	if addr == "" {
 		addr = ":8080"
 	}
-	return Config{UpstreamBaseURL: os.Getenv("UPSTREAM_BASE_URL"), UpstreamAPIKey: os.Getenv("UPSTREAM_API_KEY"), ListenAddr: addr, MaxMultipartMemory: maxMemory, ModelPrefixes: parsePrefixes(os.Getenv("MODEL_PREFIXES"))}
+	return Config{UpstreamBaseURL: os.Getenv("UPSTREAM_BASE_URL"), UpstreamAPIKey: os.Getenv("UPSTREAM_API_KEY"), ListenAddr: addr, MaxMultipartMemory: maxMemory, MaxRequestBody: maxMemory * 4, ModelPrefixes: parsePrefixes(os.Getenv("MODEL_PREFIXES"))}
 }
