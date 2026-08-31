@@ -221,7 +221,10 @@ func (b *Bridge) forwardRaw(c *gin.Context, route string, data []byte, contentTy
 	req.Header.Set("Content-Type", contentType)
 	auth := c.GetHeader("Authorization")
 	if auth == "" && b.cfg.UpstreamAPIKey != "" {
-		auth = "Bearer " + b.cfg.UpstreamAPIKey
+		auth = b.cfg.UpstreamAPIKey
+		if !strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+			auth = "Bearer " + auth
+		}
 	}
 	if auth != "" {
 		req.Header.Set("Authorization", auth)
