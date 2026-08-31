@@ -251,6 +251,8 @@ func upstreamEndpoint(base, route string) (string, error) {
 	if !strings.HasSuffix(parsed.Path, "/v1") {
 		parsed.Path = path.Join(parsed.Path, "v1")
 	}
+	route = strings.TrimPrefix(route, "/")
+	route = strings.TrimPrefix(route, "v1/")
 	parsed.Path = path.Join(parsed.Path, route)
 	return parsed.String(), nil
 }
@@ -273,5 +275,9 @@ func LoadConfig() Config {
 	if addr == "" {
 		addr = ":8080"
 	}
-	return Config{UpstreamBaseURL: os.Getenv("UPSTREAM_BASE_URL"), UpstreamAPIKey: os.Getenv("UPSTREAM_API_KEY"), ListenAddr: addr, MaxMultipartMemory: maxMemory, MaxRequestBody: maxMemory * 4, ModelPrefixes: parsePrefixes(os.Getenv("MODEL_PREFIXES"))}
+	prefixes := parsePrefixes(os.Getenv("MODEL_PREFIXES"))
+	if len(prefixes) == 0 {
+		prefixes = []string{"gemini"}
+	}
+	return Config{UpstreamBaseURL: os.Getenv("UPSTREAM_BASE_URL"), UpstreamAPIKey: os.Getenv("UPSTREAM_API_KEY"), ListenAddr: addr, MaxMultipartMemory: maxMemory, MaxRequestBody: maxMemory * 4, ModelPrefixes: prefixes}
 }
