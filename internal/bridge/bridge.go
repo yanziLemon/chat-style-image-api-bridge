@@ -153,6 +153,18 @@ func (b *Bridge) handleEdits(c *gin.Context) {
 	}
 	b.forwardChat(c, buildChatRequest(model, "", parts, c.PostForm("size")))
 }
+func (b *Bridge) handlesModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" || len(b.cfg.ModelPrefixes) == 0 {
+		return false
+	}
+	for _, prefix := range b.cfg.ModelPrefixes {
+		if strings.HasPrefix(model, strings.ToLower(strings.TrimSpace(prefix))) {
+			return true
+		}
+	}
+	return false
+}
 func buildChatRequest(model, prompt string, parts []contentPart, size string) chatRequest {
 	var content any = prompt
 	if parts != nil {
