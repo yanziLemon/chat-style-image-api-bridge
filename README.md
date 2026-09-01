@@ -23,6 +23,18 @@ Then configure the fixed client to use this bridge as its OpenAI-compatible base
 http://your-server:8080/v1
 ```
 
+## Caddy
+
+This bridge can be used behind [Caddy](https://caddyserver.com/) as the public HTTPS entry point. Caddy can route `/v1/images/*` to this bridge and forward other `/v1/*` requests directly to NewAPI.
+
+Request flow:
+
+```text
+Client -> Caddy -> /v1/images/* -> Bridge -> NewAPI /v1/chat/completions
+Client -> Caddy -> other /v1/* -> NewAPI
+```
+
+The bridge converts image requests and returns the upstream response to the client. Caddy handles HTTPS and routing; NewAPI handles authentication, model routing, and upstream requests.
 ## Request conversion
 
 ### Generations
