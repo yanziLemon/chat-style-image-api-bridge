@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -22,7 +24,6 @@ type Config struct {
 	UpstreamAPIKey     string
 	ListenAddr         string
 	MaxMultipartMemory int64
-	MaxRequestBody     int64
 	ModelPrefixes      []string
 }
 
@@ -62,6 +63,29 @@ type imageURLPart struct {
 	URL string `json:"url"`
 }
 
+type chatCompletionResponse struct {
+	Created int64 `json:"created"`
+	Choices []struct {
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+type imageGenerationResponse struct {
+	Created int64                  `json:"created"`
+	Data    []imageGenerationDatum `json:"data"`
+}
+
+type imageGenerationDatum struct {
+	B64JSON string `json:"b64_json"`
+}
+
+var (
+	dataImagePattern = regexp.MustCompile(`data:image/[^;"\s]+;base64,([^"\)\s]+)`)
+	imageURLPattern  = regexp.MustCompile(`https?://[^"\s\)]+`)
+)
+
 func New(cfg Config) *Bridge {
 	return &Bridge{cfg: cfg, httpClient: &http.Client{}}
 }
@@ -73,7 +97,7 @@ func (b *Bridge) Register(r *gin.Engine) {
 }
 
 func (b *Bridge) handleGenerations(c *gin.Context) {
-	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, b.cfg.MaxRequestBody))
+	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
 		return
@@ -95,7 +119,7 @@ func (b *Bridge) handleGenerations(c *gin.Context) {
 }
 
 func (b *Bridge) handleEdits(c *gin.Context) {
-	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, b.cfg.MaxRequestBody))
+	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
 		return
@@ -171,9 +195,13 @@ func buildChatRequest(model, prompt string, parts []contentPart, size string) ch
 	if parts != nil {
 		content = parts
 	}
-	req := chatRequest{Model: model, Stream: false, Messages: []chatMessage{{Role: "user", Content: content}}}
+	messages := []chatMessage{{Role: "user", Content: content}}
+	req := chatRequest{Model: model, Stream: false, Messages: messages}
 	if ratio := sizeToAspectRatio(size); ratio != "" {
-		req.ExtraBody = map[string]any{"imageConfig": map[string]string{"aspectRatio": ratio}}
+		imageConfig := map[string]string{"aspectRatio": ratio}
+		configJSON, _ := json.Marshal(map[string]map[string]string{"imageConfig": imageConfig})
+		req.Messages = append([]chatMessage{{Role: "system", Content: string(configJSON)}}, req.Messages...)
+		req.ExtraBody = map[string]any{"imageConfig": imageConfig}
 	}
 	return req
 }
@@ -201,7 +229,47 @@ func (b *Bridge) forwardChat(c *gin.Context, payload chatRequest) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error(), "type": "bridge_error"}})
 		return
 	}
-	b.forwardRaw(c, "/v1/chat/completions", data, "application/json")
+	endpoint, err := upstreamEndpoint(b.cfg.UpstreamBaseURL, "/v1/chat/completions")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error(), "type": "configuration_error"}})
+		return
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error(), "type": "bridge_error"}})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	b.setAuthorization(c, req)
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": err.Error(), "type": "upstream_error"}})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		b.copyUpstreamResponse(c, resp)
+		return
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": err.Error(), "type": "upstream_error"}})
+		return
+	}
+	imageBase64, err := b.imageBase64FromChatResponse(c.Request.Context(), responseBody)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": err.Error(), "type": "upstream_error"}})
+		return
+	}
+	var chatResponse chatCompletionResponse
+	if err := json.Unmarshal(responseBody, &chatResponse); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "invalid chat response from upstream", "type": "upstream_error"}})
+		return
+	}
+	c.JSON(http.StatusOK, imageGenerationResponse{
+		Created: chatResponse.Created,
+		Data:    []imageGenerationDatum{{B64JSON: imageBase64}},
+	})
 }
 
 func (b *Bridge) forwardRaw(c *gin.Context, route string, data []byte, contentType string) {
@@ -219,6 +287,17 @@ func (b *Bridge) forwardRaw(c *gin.Context, route string, data []byte, contentTy
 		contentType = "application/octet-stream"
 	}
 	req.Header.Set("Content-Type", contentType)
+	b.setAuthorization(c, req)
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": err.Error(), "type": "upstream_error"}})
+		return
+	}
+	defer resp.Body.Close()
+	b.copyUpstreamResponse(c, resp)
+}
+
+func (b *Bridge) setAuthorization(c *gin.Context, req *http.Request) {
 	auth := c.GetHeader("Authorization")
 	if auth == "" && b.cfg.UpstreamAPIKey != "" {
 		auth = b.cfg.UpstreamAPIKey
@@ -229,12 +308,9 @@ func (b *Bridge) forwardRaw(c *gin.Context, route string, data []byte, contentTy
 	if auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": err.Error(), "type": "upstream_error"}})
-		return
-	}
-	defer resp.Body.Close()
+}
+
+func (b *Bridge) copyUpstreamResponse(c *gin.Context, resp *http.Response) {
 	for key, values := range resp.Header {
 		for _, value := range values {
 			c.Header(key, value)
@@ -243,6 +319,56 @@ func (b *Bridge) forwardRaw(c *gin.Context, route string, data []byte, contentTy
 	c.Status(resp.StatusCode)
 	_, _ = io.Copy(c.Writer, resp.Body)
 }
+
+func (b *Bridge) imageBase64FromChatResponse(ctx context.Context, responseBody []byte) (string, error) {
+	var chatResponse chatCompletionResponse
+	if err := json.Unmarshal(responseBody, &chatResponse); err != nil {
+		return "", fmt.Errorf("invalid chat response from upstream")
+	}
+	if len(chatResponse.Choices) == 0 {
+		return "", fmt.Errorf("upstream chat response did not include a choice")
+	}
+	var content string
+	if err := json.Unmarshal(chatResponse.Choices[0].Message.Content, &content); err != nil || strings.TrimSpace(content) == "" {
+		return "", fmt.Errorf("upstream chat response did not include text image content")
+	}
+	if match := dataImagePattern.FindStringSubmatch(content); len(match) == 2 {
+		if _, err := base64.StdEncoding.DecodeString(match[1]); err != nil {
+			return "", fmt.Errorf("upstream chat response contained invalid image base64")
+		}
+		return match[1], nil
+	}
+	imageURL := imageURLPattern.FindString(content)
+	if imageURL == "" {
+		return "", fmt.Errorf("upstream chat response did not include an image URL")
+	}
+	return b.downloadImageBase64(ctx, imageURL)
+}
+
+func (b *Bridge) downloadImageBase64(ctx context.Context, imageURL string) (string, error) {
+	parsed, err := url.ParseRequestURI(imageURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return "", fmt.Errorf("upstream chat response contained an invalid image URL")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("image download returned status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
+}
+
 func upstreamEndpoint(base, route string) (string, error) {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base == "" {
@@ -283,5 +409,5 @@ func LoadConfig() Config {
 	if len(prefixes) == 0 {
 		prefixes = []string{"gemini"}
 	}
-	return Config{UpstreamBaseURL: os.Getenv("UPSTREAM_BASE_URL"), UpstreamAPIKey: os.Getenv("UPSTREAM_API_KEY"), ListenAddr: addr, MaxMultipartMemory: maxMemory, MaxRequestBody: maxMemory * 4, ModelPrefixes: prefixes}
+	return Config{UpstreamBaseURL: os.Getenv("UPSTREAM_BASE_URL"), UpstreamAPIKey: os.Getenv("UPSTREAM_API_KEY"), ListenAddr: addr, MaxMultipartMemory: maxMemory, ModelPrefixes: prefixes}
 }

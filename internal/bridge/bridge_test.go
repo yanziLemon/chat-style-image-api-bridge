@@ -21,7 +21,6 @@ func testBridge(t *testing.T, upstream http.Handler) (*ginTestServer, *httptest.
 		UpstreamAPIKey:     "Bearer test-upstream",
 		ListenAddr:         ":0",
 		MaxMultipartMemory: 1 << 20,
-		MaxRequestBody:     4 << 20,
 		ModelPrefixes:      []string{"gemini"},
 	}
 	return newGinTestServer(New(cfg)), upstreamServer
@@ -51,8 +50,7 @@ func TestGenerationGeminiConvertsToChat(t *testing.T) {
 			t.Errorf("decode upstream body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = io.WriteString(w, `{"ok":true}`)
+		_, _ = io.WriteString(w, `{"created":123,"choices":[{"message":{"content":"data:image/png;base64,aW1hZ2U="}}]}`)
 	}))
 	defer upstream.Close()
 
@@ -64,14 +62,45 @@ func TestGenerationGeminiConvertsToChat(t *testing.T) {
 	if gotPath != "/v1/chat/completions" {
 		t.Fatalf("path = %q", gotPath)
 	}
-	if got.Model != "gemini-2.5-flash-image" || got.Messages[0].Content != "cat" {
+	if got.Model != "gemini-2.5-flash-image" || len(got.Messages) != 2 || got.Messages[0].Role != "system" || got.Messages[0].Content != `{"imageConfig":{"aspectRatio":"16:9"}}` || got.Messages[1].Role != "user" || got.Messages[1].Content != "cat" {
 		t.Fatalf("unexpected chat request: %+v", got)
 	}
 	if got.ExtraBody["imageConfig"].(map[string]any)["aspectRatio"] != "16:9" {
 		t.Fatalf("missing aspect ratio: %+v", got.ExtraBody)
 	}
-	if w.Code != http.StatusCreated || w.Body.String() != `{"ok":true}` {
-		t.Fatalf("response = %d %s", w.Code, w.Body.String())
+	var response imageGenerationResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if w.Code != http.StatusOK || response.Created != 123 || len(response.Data) != 1 || response.Data[0].B64JSON != "aW1hZ2U=" {
+		t.Fatalf("response = %d %+v", w.Code, response)
+	}
+}
+
+func TestGenerationGeminiConvertsChatImageURLToBase64(t *testing.T) {
+	var imageURL string
+	bridge, upstream := testBridge(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/generated.png" {
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write([]byte("image-bytes"))
+			return
+		}
+		_, _ = io.WriteString(w, `{"created":456,"choices":[{"message":{"content":"![image](`+imageURL+`)"}}]}`)
+	}))
+	defer upstream.Close()
+	imageURL = upstream.URL + "/generated.png"
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gemini-image","prompt":"cat"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	bridge.handler.ServeHTTP(w, req)
+
+	var response imageGenerationResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if w.Code != http.StatusOK || response.Created != 456 || len(response.Data) != 1 || response.Data[0].B64JSON != "aW1hZ2UtYnl0ZXM=" {
+		t.Fatalf("response = %d %+v", w.Code, response)
 	}
 }
 
@@ -104,7 +133,7 @@ func TestEditGeminiConvertsMultipleImages(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 			t.Errorf("decode upstream body: %v", err)
 		}
-		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"created":789,"choices":[{"message":{"content":"data:image/jpeg;base64,aW1hZ2U="}}]}`)
 	}))
 	defer upstream.Close()
 	body, contentType := multipartBody(t, "gemini-image", "combine", multipartImage{"image", "a.png", "image/png", "first"}, multipartImage{"image", "b.jpg", "image/jpeg", "second"})
@@ -112,10 +141,10 @@ func TestEditGeminiConvertsMultipleImages(t *testing.T) {
 	req.Header.Set("Content-Type", contentType)
 	w := httptest.NewRecorder()
 	bridge.handler.ServeHTTP(w, req)
-	if len(got.Messages) != 1 {
+	if len(got.Messages) != 2 || got.Messages[0].Role != "system" || got.Messages[0].Content != `{"imageConfig":{"aspectRatio":"1:1"}}` || got.Messages[1].Role != "user" {
 		t.Fatalf("messages = %+v", got.Messages)
 	}
-	parts := got.Messages[0].Content.([]any)
+	parts := got.Messages[1].Content.([]any)
 	if len(parts) != 3 {
 		t.Fatalf("parts = %d", len(parts))
 	}
@@ -124,6 +153,13 @@ func TestEditGeminiConvertsMultipleImages(t *testing.T) {
 	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
+	}
+	var response imageGenerationResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Created != 789 || len(response.Data) != 1 || response.Data[0].B64JSON != "aW1hZ2U=" {
+		t.Fatalf("response = %+v", response)
 	}
 }
 
